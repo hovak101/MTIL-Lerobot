@@ -1,0 +1,24 @@
+[project]
+name = "lerobot_policy_mtil"
+version = "0.1.0"
+description = "MTIL: Mamba Temporal Imitation Learning policy plugin for LeRobot."
+requires-python = ">=3.12"
+dependencies = [
+    "lerobot",
+    "torch>=2.1",
+    "einops",
+    "transformers>=4.40",
+    # Mamba-2 selective scan kernel. Requires CUDA + Triton; no CPU fallback.
+    "mamba-ssm>=2.2.0",
+    "causal-conv1d>=1.4.0",
+]
+
+[project.scripts]
+lerobot-policy-mtil-train = "lerobot_policy_mtil.train_mtil:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
