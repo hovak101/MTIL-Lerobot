@@ -1,6 +1,7 @@
 # Project-specific
 lerobot/
 outputs/
+data/
 
 # Python build / install
 __pycache__/
