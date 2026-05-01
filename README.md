@@ -1,5 +1,9 @@
 ## Setup
 
+```bash
+git clone --recurse-submodules https://github.com/hovak101/cs152_final_project.git
+```
+
 ## Data Collection + Inference Commands
 
 ### find arm port:
