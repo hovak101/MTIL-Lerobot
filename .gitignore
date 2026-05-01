@@ -3,6 +3,7 @@ outputs/
 data/
 models/
 .claude/
+logs/
 
 # Python build / install
 __pycache__/

@@ -4,6 +4,26 @@
 git clone --recurse-submodules https://github.com/hovak101/cs152_final_project.git
 ```
 
+### If Processing Inference Through LAN PC:
+```bash
+pip install -e 'lerobot[async]'
+```
+
+#### On server:
+##### find ip:
+```bash
+hostname -I | awk '{print $1}'
+```
+##### launch:
+```bash
+bash scripts/serve_mtil.sh
+```
+
+#### On client:
+```bash
+bash scripts/rollout_client.sh <ip_address>
+```
+
 ## Data Collection + Inference Commands
 
 ### find arm port:
