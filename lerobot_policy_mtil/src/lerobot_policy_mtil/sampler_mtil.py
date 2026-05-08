@@ -38,6 +38,7 @@ class MTILEpisodicDataset(Dataset):
         feature_cache: torch.Tensor | None = None,
         camera_keys: list[str] | None = None,
         metadata_cache: dict[str, torch.Tensor] | None = None,
+        image_cache: dict[str, torch.Tensor] | None = None,
     ):
         self.base = base_dataset
         self._plan: list[tuple[int, bool, bool]] = []
@@ -48,6 +49,10 @@ class MTILEpisodicDataset(Dataset):
         # chunked action, action_is_pad, episode_index, etc.). When set, the
         # __getitem__ fast path becomes pure tensor indexing — no parquet I/O.
         self._metadata_cache = metadata_cache
+        # Per-camera uint8 image cache, shape (N, 3, S, S). When paired with
+        # `metadata_cache`, __getitem__ becomes pure tensor indexing — no video
+        # decode either. Train-loop converts uint8 -> float32/255 upstream.
+        self._image_cache = image_cache
         # On the first cached lookup, we compare the (video-skipped) key set
         # against a live full-decode call so a future LeRobot DatasetReader API
         # change fails loudly instead of silently dropping fields.
@@ -69,9 +74,11 @@ class MTILEpisodicDataset(Dataset):
             real_idx, is_pad, is_first = self._plan[key]
         if self._metadata_cache is not None:
             # Fast path: O(1) slicing into pre-stacked tensors. No parquet I/O,
-            # no video decode. Used when both DINOv2 features AND metadata
-            # (state, action chunks, action_is_pad, ...) are precomputed.
+            # no video decode (when image_cache is also set).
             item = {k: v[real_idx] for k, v in self._metadata_cache.items()}
+            if self._image_cache is not None:
+                for cam_k, cam_tensor in self._image_cache.items():
+                    item[cam_k] = cam_tensor[real_idx]  # uint8 (3, S, S)
             if self._feature_cache is not None:
                 item[DINO_FEATURES_KEY] = self._feature_cache[real_idx]
         elif self._feature_cache is not None:

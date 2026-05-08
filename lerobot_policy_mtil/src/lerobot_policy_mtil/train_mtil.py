@@ -69,6 +69,7 @@ def _build_mtil_dataloader(
     pin_memory: bool,
     feature_cache: torch.Tensor | None = None,
     metadata_cache: dict[str, torch.Tensor] | None = None,
+    image_cache: dict[str, torch.Tensor] | None = None,
     prefetch_factor: int | None = None,
     persistent_workers: bool = True,
     episode_starts: list[int] | None = None,
@@ -82,6 +83,7 @@ def _build_mtil_dataloader(
         feature_cache=feature_cache,
         camera_keys=image_keys,
         metadata_cache=metadata_cache,
+        image_cache=image_cache,
     )
     if episode_starts is None or episode_ends is None:
         episode_starts = list(dataset.meta.episodes["dataset_from_index"])
@@ -288,6 +290,63 @@ def _precompute_dinov2_cache(
 
 
 @torch.no_grad()
+def _precompute_image_cache(
+    base_dataset,
+    image_keys: list[str],
+    image_size: int,
+    *,
+    batch_size: int = 64,
+    num_workers: int = 4,
+) -> dict[str, torch.Tensor]:
+    """Decode every frame once, resize to (S, S), store as uint8 in CPU RAM.
+
+    Returns a dict keyed by camera name with tensors of shape
+    ``(num_frames, 3, S, S)`` dtype ``uint8``. Total RAM ~= num_frames *
+    n_cams * 3 * S^2 bytes.
+
+    The bottleneck before this cache was libsvtav1 video decode + per-frame
+    parquet lookups (see ``_precompute_metadata_cache`` for the parquet half).
+    Workers parallelize video decode; the result is read-only and shared
+    across DataLoader workers via copy-on-write.
+    """
+    num_frames = len(base_dataset)
+    cache = {
+        k: torch.empty(num_frames, 3, image_size, image_size, dtype=torch.uint8)
+        for k in image_keys
+    }
+
+    loader = torch.utils.data.DataLoader(
+        _FrameImageDataset(base_dataset, image_keys),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=False,
+        collate_fn=_frames_collate,
+        pin_memory=False,
+        persistent_workers=False,
+    )
+
+    idx = 0
+    pbar = tqdm(total=num_frames, desc="Precomputing images", unit="f")
+    for batch in loader:
+        first = batch[image_keys[0]]
+        N = first.shape[0]
+        for k in image_keys:
+            img = batch[k]  # float32 in [0,1] (lerobot default) or uint8
+            if img.dtype == torch.uint8:
+                img = img.to(torch.float32) / 255.0
+            if img.shape[-2:] != (image_size, image_size):
+                img = torch.nn.functional.interpolate(
+                    img, size=(image_size, image_size), mode="bilinear", align_corners=False
+                )
+            img_u8 = (img * 255.0).clamp(0, 255).to(torch.uint8)
+            cache[k][idx : idx + N] = img_u8
+        idx += N
+        pbar.update(N)
+    pbar.close()
+    return cache
+
+
+@torch.no_grad()
 def _precompute_metadata_cache(
     base_dataset,
     *,
@@ -418,55 +477,46 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         dataset_stats=dataset.meta.stats,
     )
 
-    # Precompute DINOv2 features (huge speedup; valid only when image transforms
-    # are off, since random per-epoch transforms would invalidate the cache).
-    feature_cache: torch.Tensor | None = None
+    # Cache decoded images (uint8 at dinov2_image_size) and per-frame metadata
+    # in CPU RAM. DINOv2-Large still runs live on GPU every step — only the
+    # video decode + parquet lookups are eliminated. Workers see the caches
+    # via copy-on-write (Linux fork mode), so per-worker RAM stays flat.
+    feature_cache: torch.Tensor | None = None  # legacy [CLS] cache, unused
+    image_cache: dict[str, torch.Tensor] | None = None
+    metadata_cache: dict[str, torch.Tensor] | None = None
     if cfg.policy.freeze_dinov2 and not cfg.dataset.image_transforms.enable:
+        image_keys = sorted(cfg.policy.image_features.keys())
         if is_main:
-            logging.info("Moving DINOv2 to device for precompute")
-        policy.dinov2 = policy.dinov2.to(device)
-        # Buffers used by `_normalize_for_dinov2` must travel with the encoder.
-        policy._imagenet_mean = policy._imagenet_mean.to(device)
-        policy._imagenet_std = policy._imagenet_std.to(device)
-        if is_main:
-            logging.info("Precomputing DINOv2 features (one-time)")
-        feature_cache = _precompute_dinov2_cache(
-            policy, dataset, device,
+            logging.info("Precomputing image cache (decode every frame once into uint8 RAM tensor)")
+        image_cache = _precompute_image_cache(
+            dataset,
+            image_keys=image_keys,
+            image_size=cfg.policy.dinov2_image_size,
             batch_size=64,
             num_workers=max(cfg.num_workers, 2),
         )
         if is_main:
-            mb = feature_cache.numel() * feature_cache.element_size() / 1e6
-            logging.info(
-                f"DINOv2 cache ready: shape={tuple(feature_cache.shape)} dtype={feature_cache.dtype} ({mb:.1f} MB)"
-            )
+            total_gb = sum(t.numel() * t.element_size() for t in image_cache.values()) / 1e9
+            shapes = {k: tuple(v.shape) for k, v in image_cache.items()}
+            logging.info(f"Image cache ready: {shapes} uint8 ({total_gb:.2f} GB)")
 
-    # Precompute per-frame non-image metadata (state, action chunks,
-    # action_is_pad, ...). With chunk_size=50 the dataset reader does ~51
-    # parquet row lookups per frame; this turns __getitem__ into pure tensor
-    # indexing and is the single biggest win for high-B*T training throughput.
-    metadata_cache: dict[str, torch.Tensor] | None = None
-    if cfg.policy.freeze_dinov2 and not cfg.dataset.image_transforms.enable:
         if is_main:
-            logging.info("Precomputing per-frame metadata cache (one-time)")
-        image_keys = sorted(cfg.policy.image_features.keys())
+            logging.info("Precomputing per-frame metadata cache (state, action chunks, ...)")
         metadata_cache = _precompute_metadata_cache(
-            dataset, image_keys=image_keys, feature_cache=feature_cache
+            dataset, image_keys=image_keys, feature_cache=None
         )
         if is_main:
             total_mb = sum(t.numel() * t.element_size() for t in metadata_cache.values()) / 1e6
             shapes = {k: tuple(v.shape) for k, v in metadata_cache.items()}
             logging.info(f"Metadata cache ready: {shapes} ({total_mb:.1f} MB)")
-
-    if not (cfg.policy.freeze_dinov2 and not cfg.dataset.image_transforms.enable) and is_main:
+    elif is_main:
         logging.warning(
             colored(
-                "DINOv2 cache disabled "
+                "Image and metadata caches disabled "
                 f"(freeze_dinov2={cfg.policy.freeze_dinov2}, "
                 f"image_transforms.enable={cfg.dataset.image_transforms.enable}). "
-                "Each training step will pay the full DINOv2 forward cost — expect "
-                "3-10x slower per-step throughput on consumer hardware. To stay within "
-                "a 6h training budget, freeze DINOv2 and disable image transforms.",
+                "Each step will run video decode + parquet lookups for every frame "
+                "— expect heavy CPU/disk load and low GPU utilization.",
                 "yellow",
                 attrs=["bold"],
             )
@@ -584,6 +634,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         pin_memory=device.type == "cuda",
         feature_cache=feature_cache,
         metadata_cache=metadata_cache,
+        image_cache=image_cache,
         prefetch_factor=getattr(cfg, "prefetch_factor", None),
         persistent_workers=getattr(cfg, "persistent_workers", True),
         episode_starts=train_starts,
@@ -607,6 +658,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             pin_memory=device.type == "cuda",
             feature_cache=feature_cache,
             metadata_cache=metadata_cache,
+            image_cache=image_cache,
             prefetch_factor=None,
             persistent_workers=False,
             episode_starts=val_starts,

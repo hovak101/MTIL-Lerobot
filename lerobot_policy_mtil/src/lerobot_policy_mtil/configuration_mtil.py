@@ -1,4 +1,4 @@
-"""MTIL policy configuration."""
+"""MTIL policy configuration — defaults match the official paper."""
 
 from dataclasses import dataclass, field
 
@@ -11,94 +11,95 @@ from lerobot.optim import AdamWConfig
 class MTILConfig(PreTrainedConfig):
     """Configuration for the Mamba Temporal Imitation Learning (MTIL) policy.
 
-    MTIL encodes the entire trajectory history into a Mamba-2 recurrent hidden state
-    and predicts an action chunk conditioned on `(o_t, h_t)`. Training requires
-    sequential, in-order, full-episode trajectories — supplied by `train_mtil.py`'s
-    custom sampler. The standard `lerobot-train` script's IID sampling is unsuitable.
+    Defaults reproduce the architecture and optimizer used in the official
+    paper implementation (https://github.com/yulinzhouZYL/MTIL,
+    `MambaConfig` + `LitMambaModel` in train.py). Only deviations from the
+    paper are those required to live inside lerobot's policy/processor/
+    sampler framework.
     """
 
-    # --- Action chunking ---
+    # --- Action chunking (paper: future_steps = 16) ---
     n_obs_steps: int = 1
-    chunk_size: int = 50
-    # Default replans every 20 env steps (chunk_size still 50, so the head
-    # always supervises a 50-step horizon).
-    n_action_steps: int = 20
+    chunk_size: int = 16
+    # Replans every 16 env steps by default — i.e. consume the entire chunk
+    # before re-running the policy. Override on the CLI to replan more often.
+    n_action_steps: int = 16
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
-            "VISUAL": NormalizationMode.IDENTITY,  # DINOv2 has its own normalization
+            "VISUAL": NormalizationMode.IDENTITY,  # DINOv2 has its own ImageNet norm
             "STATE": NormalizationMode.MEAN_STD,
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
 
-    # --- Encoder ---
-    dinov2_variant: str = "facebook/dinov2-base"
+    # --- Encoder (paper: DINOv2 ViT-L/14, frozen, layer -4 spatial features) ---
+    dinov2_variant: str = "facebook/dinov2-large"
     freeze_dinov2: bool = True
+    # Square multiple of 14. Paper uses 640x480 native; 224 keeps DINOv2-Large
+    # cost tractable on consumer GPUs (16 GB and below). Bump to 308/392 if
+    # you have headroom and want closer parity with the paper's resolution.
     dinov2_image_size: int = 224
+    # Per-call micro-batch size for the live DINOv2 forward. Each step encodes
+    # `B*T*n_cams` images; running them all in one DINOv2 call peaks at several
+    # GB of intermediate activations. None = single call (fastest, highest
+    # peak); a small int = chunked calls (slower per step, lower peak). 64 is
+    # a good default for 16 GB GPUs at d_model=2048.
+    dinov2_micro_batch: int | None = 64
 
-    # --- Cross-modal fusion (paper Fig. 1) ---
-    # State token cross-attends to per-camera DINOv2 [CLS] tokens, then FFN.
-    # Output is a single d_model token per timestep, fed into the Mamba stack.
-    cross_attn_heads: int = 8
+    # --- Cross-camera self-attention (paper: 16 heads on d_model) ---
+    cross_cam_heads: int = 16
 
-    # --- Mamba-2 backbone ---
-    d_model: int = 512
-    # Tuned for full-episode parallel scan on a single 24 GB GPU. Per-layer
-    # scan activation memory scales linearly with depth, so 4 layers fit
-    # comfortably while 6 was borderline on long-episode datasets.
+    # --- Cross-modal attention: cam Q, deeply-projected state KV ---
+    cross_modal_heads: int = 8
+    # Dropout inside the deep state projection (14 -> 128 -> 512 -> d_model);
+    # paper hardcodes 0.20 between the 512 linear and the d_model linear.
+    cross_modal_dropout: float = 0.20
+
+    # --- Spatial adapter dropout (paper: 0.10 after the LayerNorm + ReLU) ---
+    spatial_dropout: float = 0.10
+
+    # --- Mamba-2 backbone (paper: d_model=2048, d_state=512, headdim=128, 4 layers) ---
+    d_model: int = 2048
     n_mamba_layers: int = 4
-    mamba_d_state: int = 128
+    mamba_d_state: int = 512
     mamba_d_conv: int = 4
     mamba_expand: int = 2
-    mamba_headdim: int = 64
+    mamba_headdim: int = 128
 
-    # --- Inference temporal aggregation ---
-    # If set, n_action_steps must equal 1 (matches ACT contract).
+    # --- Inference temporal aggregation (off by default) ---
     temporal_ensemble_coeff: float | None = None
 
     # --- Training memory management ---
     # Number of episodes laid out in parallel along the batch dimension.
-    # Default 2 leaves head-room for unusually long episodes on a 24 GB GPU;
-    # raise on bigger hardware.
+    # Paper trains with batch_size=1; lerobot's full-episode parallel scan
+    # makes batch_episodes>1 cheap when GPU memory allows.
     batch_episodes: int = 2
-    # None (default, RECOMMENDED) = full-episode forward: each batch covers
-    # entire episodes (padded to the longest in the group of `batch_episodes`).
-    # Mamba-2's parallel scan carries hidden state through the whole episode in
-    # a single forward — this is the paper's algorithm.
-    #
-    # Setting `max_seq_len` is a MEMORY ESCAPE HATCH WITH DEGRADED FIDELITY:
-    # Mamba-2 has no public initial-state forward API, so each truncated
-    # sub-sequence cold-starts from zero hidden state during training. The
-    # paper's full-history claim is no longer honoured. Only use this if a
-    # specific episode genuinely will not fit in memory at full length.
+    # None = full-episode forward (paper-faithful: Mamba parallel scan over
+    # the entire episode). Setting an int truncates with cold-start hidden
+    # state per sub-sequence — escape hatch only.
     max_seq_len: int | None = None
 
-    # --- Optimizer ---
-    optimizer_lr: float = 1e-4
-    # Bumped from AdamW's standard 1e-4 to 1e-2 because real-world IL datasets
-    # at the user's scale (50–100 episodes) overfit aggressively. Lower this if
-    # you have substantially more demonstrations.
-    optimizer_weight_decay: float = 1e-2
-    # Kept separate so the encoder can be fine-tuned at a smaller LR if unfrozen.
-    optimizer_lr_dinov2: float = 0.0
+    # --- Optimizer (paper: AdamW lr=2e-4, wd=5e-4) ---
+    optimizer_lr: float = 2e-4
+    optimizer_weight_decay: float = 5e-4
+    optimizer_lr_dinov2: float = 0.0  # encoder is frozen
+
+    # --- LR schedule (paper: CosineAnnealingLR, T_max=200 epochs, eta_min=0.5e-6) ---
+    # We translate to step counts here. `lr_decay_steps` auto-scales when
+    # --steps is shorter (see CosineDecayWithWarmupSchedulerConfig).
+    lr_warmup_steps: int = 0
+    lr_decay_steps: int = 100_000
+    lr_min: float = 5e-7
 
     # --- Regularization ---
-    # Single dropout knob driving three sites: after cross-attn out-proj,
-    # after the cross-modal FFN, and after each Mamba-2 residual addition.
-    # Set to 0.0 for strict paper parity.
-    dropout: float = 0.1
-    # Gaussian noise stdev added to cached DINOv2 features at training time
-    # only. Cheap "augmentation" that doesn't invalidate the cache. 0.0 disables;
-    # try 0.02 for SO-101-scale data.
-    dino_feature_noise_std: float = 0.0
+    # Per-feature Gaussian noise added to the (already MEAN_STD-normalized)
+    # state during training only. Paper applies 0.02 x per-joint-std on raw
+    # radians; in normalized units that is 0.02 flat.
+    state_noise_std: float = 0.02
 
     # --- Validation ---
-    # Fraction of *episodes* (not frames) held out for val-loss tracking.
-    # Episode-level — frame-level would leak in-episode history into val.
     val_split: float = 0.1
-    # Run a val pass every `val_freq` optimizer steps; the best-val checkpoint
-    # is saved separately under `<output_dir>/checkpoints/best/`.
     val_freq: int = 500
 
     def __post_init__(self) -> None:
@@ -121,26 +122,37 @@ class MTILConfig(PreTrainedConfig):
             raise ValueError("max_seq_len must be None or >= 1.")
         if self.n_obs_steps != 1:
             raise ValueError("MTIL consumes one frame at a time (n_obs_steps must be 1).")
-        if self.d_model % self.cross_attn_heads != 0:
+        if self.d_model % self.cross_modal_heads != 0:
             raise ValueError(
-                f"d_model ({self.d_model}) must be divisible by cross_attn_heads "
-                f"({self.cross_attn_heads})."
+                f"d_model ({self.d_model}) must be divisible by cross_modal_heads "
+                f"({self.cross_modal_heads})."
             )
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError(f"dropout must be in [0.0, 1.0); got {self.dropout}.")
-        if self.dino_feature_noise_std < 0.0:
+        if self.d_model % self.cross_cam_heads != 0:
             raise ValueError(
-                f"dino_feature_noise_std must be >= 0.0; got {self.dino_feature_noise_std}."
+                f"d_model ({self.d_model}) must be divisible by cross_cam_heads "
+                f"({self.cross_cam_heads})."
+            )
+        if not 0.0 <= self.cross_modal_dropout < 1.0:
+            raise ValueError(
+                f"cross_modal_dropout must be in [0.0, 1.0); got {self.cross_modal_dropout}."
+            )
+        if not 0.0 <= self.spatial_dropout < 1.0:
+            raise ValueError(
+                f"spatial_dropout must be in [0.0, 1.0); got {self.spatial_dropout}."
+            )
+        if self.state_noise_std < 0.0:
+            raise ValueError(
+                f"state_noise_std must be >= 0.0; got {self.state_noise_std}."
+            )
+        if self.dinov2_micro_batch is not None and self.dinov2_micro_batch < 1:
+            raise ValueError(
+                f"dinov2_micro_batch must be None or >= 1; got {self.dinov2_micro_batch}."
             )
         if not 0.0 <= self.val_split < 1.0:
             raise ValueError(f"val_split must be in [0.0, 1.0); got {self.val_split}.")
         if self.val_freq < 1:
             raise ValueError(f"val_freq must be >= 1; got {self.val_freq}.")
 
-        # Fail fast if mamba_ssm / causal_conv1d aren't installed. These are
-        # CUDA + Triton wheels; the model module imports them lazily, so
-        # without this probe the user sees the failure only after the dataset
-        # has already loaded.
         try:
             import mamba_ssm  # noqa: F401
             import causal_conv1d  # noqa: F401
@@ -161,13 +173,18 @@ class MTILConfig(PreTrainedConfig):
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(lr=self.optimizer_lr, weight_decay=self.optimizer_weight_decay)
 
-    def get_scheduler_preset(self) -> None:
-        return None
+    def get_scheduler_preset(self):
+        from lerobot.optim.schedulers import CosineDecayWithWarmupSchedulerConfig
+
+        return CosineDecayWithWarmupSchedulerConfig(
+            num_warmup_steps=self.lr_warmup_steps,
+            num_decay_steps=self.lr_decay_steps,
+            peak_lr=self.optimizer_lr,
+            decay_lr=self.lr_min,
+        )
 
     @property
     def observation_delta_indices(self) -> None:
-        # Single frame from the dataset's POV; the sampler stitches frames into
-        # (B, T, ...) batches at the DataLoader layer.
         return None
 
     @property
