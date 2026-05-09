@@ -39,6 +39,8 @@ Please refer to the [official lerobot documentation](https://huggingface.co/docs
 
 To run the policy on a more powerful machine over LAN, launch the policy server on the inference host and the rollout client on the robot host. MTIL requires CUDA enabled gpu for inference. See `scripts/serve.sh` and `scripts/mtil_rollout_client.sh` for templates.
 
+## Results
+
 ## Citation
 
 If you use this code, please cite the original MTIL paper:
