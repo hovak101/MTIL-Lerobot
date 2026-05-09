@@ -1,3 +1,9 @@
+# MTIL-LeRobot
+
+A LeRobot implementation of **Mamba Temporal Imitation Learning (MTIL)**, 
+based on [Zhou et al., "Encoding Full History with Mamba for Temporal Imitation Learning"](https://arxiv.org/abs/2505.12410) 
+(IEEE RA-L, 2025).
+
 ## Setup
 
 ```bash
