@@ -14,7 +14,7 @@ Usage: bash scripts/rollout_client.sh <WSL_IP>}"
 
 python -m lerobot.async_inference.robot_client \
     --policy_type=mtil \
-    --pretrained_name_or_path=/home/alex/projects/cs152_final_project/outputs/train/mtil_record_test_4/checkpoints/007500/pretrained_model \
+    --pretrained_name_or_path=/home/alex/projects/MTIL-Lerobot/outputs/train/mtil_record_test_4/checkpoints/007500/pretrained_model \
     --server_address="${SERVER_IP}:8080" \
     --robot.type=so101_follower \
     --robot.port=/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE7044252-if00 \
