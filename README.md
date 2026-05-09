@@ -40,6 +40,7 @@ Please refer to the [official lerobot documentation](https://huggingface.co/docs
 To run the policy on a more powerful machine over LAN, launch the policy server on the inference host and the rollout client on the robot host. MTIL requires CUDA enabled gpu for inference. See `scripts/serve.sh` and `scripts/mtil_rollout_client.sh` for templates.
 
 ## Results
+The resources folder contains a report and you can find our presentation on [Google Slides](https://docs.google.com/presentation/d/1D5RGEx_oHiUDR4ooh0IAy3R7szCcRgLGBlwVf5lmwUc/edit?pli=1&slide=id.g3dd8f6a9490_0_396#slide=id.g3dd8f6a9490_0_396). Furthermore, you can find our recorded datatsets and model on [Hugging Face](https://huggingface.co/hovak101). Please note MTIL does not include an eval dataset because we ran inference through LAN, which does not support recording.
 
 ## Citation
 
